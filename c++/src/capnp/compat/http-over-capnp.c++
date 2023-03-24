@@ -427,9 +427,12 @@ public:
     // Pump upstream -- unless we don't expect a request body.
     kj::Maybe<kj::Promise<void>> pumpRequestTask;
     KJ_IF_MAYBE(rb, maybeRequestBody) {
-      auto bodyOut = factory.streamFactory.capnpToKj(pipeline.getRequestBody());
-      pumpRequestTask = rb->pumpTo(*bodyOut).attach(kj::mv(bodyOut)).ignoreResult()
-          .eagerlyEvaluate([state = kj::addRef(*state)](kj::Exception&& e) mutable {
+      auto bodyOut = factory.streamFactory.capnpToKjExplicitEnd(pipeline.getRequestBody());
+      pumpRequestTask = rb->pumpTo(*bodyOut)
+          .then([&bodyOut = *bodyOut](uint64_t) mutable {
+        return bodyOut.end();
+      }).eagerlyEvaluate([state = kj::addRef(*state), bodyOut = kj::mv(bodyOut)]
+                         (kj::Exception&& e) mutable {
         // A DISCONNECTED exception probably means the server decided not to read the whole request
         // before responding. In that case we simply want the pump to end, so that on this end it
         // also appears that the service simply didn't read everything. So we don't propagate the
@@ -468,11 +471,12 @@ public:
 
   kj::Promise<void> connect(
       kj::StringPtr host, const kj::HttpHeaders& headers, kj::AsyncIoStream& connection,
-      ConnectResponse& tunnel) override {
+      ConnectResponse& tunnel, kj::HttpConnectSettings settings) override {
     auto rpcRequest = inner.connectRequest();
     auto downPipe = kj::newOneWayPipe();
     rpcRequest.setHost(host);
     rpcRequest.setDown(factory.streamFactory.kjToCapnp(kj::mv(downPipe.out)));
+    rpcRequest.initSettings().setUseTls(settings.useTls);
 
     auto builder = capnp::Request<
         capnp::HttpService::ConnectParams,
@@ -491,9 +495,11 @@ public:
     });
     // We write to `up` (the other side reads from it).
     auto up = pipeline.getUp();
-    kj::Own<kj::AsyncOutputStream> upStream = factory.streamFactory.capnpToKj(up);
+    auto upStream = factory.streamFactory.capnpToKjExplicitEnd(up);
     auto upPumpTask = connection.pumpTo(*upStream)
-        .then([up = kj::mv(up), upStream = kj::mv(upStream)](uint64_t) mutable
+        .then([&upStream = *upStream](uint64_t) mutable {
+      return upStream.end();
+    }).then([up = kj::mv(up), upStream = kj::mv(upStream)]() mutable
         -> kj::Promise<void> {
       return kj::NEVER_DONE;
     });
@@ -710,9 +716,11 @@ public:
 
     replyTask = req.send().then(
         [this, errorBody = kj::mv(errorBody)](auto resp) mutable -> kj::Promise<void> {
-      auto body = factory.streamFactory.capnpToKj(resp.getBody());
-      return errorBody->pumpTo(*body).ignoreResult()
-          .attach(kj::mv(errorBody), kj::mv(body));
+      auto body = factory.streamFactory.capnpToKjExplicitEnd(resp.getBody());
+      return errorBody->pumpTo(*body)
+          .then([&body = *body](uint64_t) mutable {
+        return body.end();
+      }).attach(kj::mv(errorBody), kj::mv(body));
     });
 
     return kj::mv(pipe.out);
@@ -837,6 +845,9 @@ public:
   kj::Promise<void> connect(ConnectContext context) override {
     auto params = context.getParams();
     auto host = params.getHost();
+    kj::HttpConnectSettings settings = {
+      .useTls = params.getSettings().getUseTls()
+    };
     auto headers = factory.headersToKj(params.getHeaders());
     auto pipe = kj::newTwoWayPipe();
 
@@ -867,8 +878,7 @@ public:
       kj::Own<kj::AsyncIoStream> inner;
     };
 
-    kj::Own<kj::AsyncOutputStream> stream = factory.streamFactory.capnpToKj(
-        context.getParams().getDown());
+    auto stream = factory.streamFactory.capnpToKjExplicitEnd(context.getParams().getDown());
 
     // We want to keep the stream alive even after EofDetector is destroyed, so we need to create
     // a refcounted AsyncIoStream.
@@ -878,7 +888,9 @@ public:
 
     // We write to the `down` pipe.
     auto pumpTask = ref1->pumpTo(*stream)
-        .then([httpProxyStream = kj::mv(ref1), stream = kj::mv(stream)](uint64_t) mutable
+          .then([&stream = *stream](uint64_t) mutable {
+      return stream.end();
+    }).then([httpProxyStream = kj::mv(ref1), stream = kj::mv(stream)]() mutable
         -> kj::Promise<void> {
       return kj::NEVER_DONE;
     });
@@ -894,7 +906,7 @@ public:
     auto response = kj::heap<HttpOverCapnpConnectResponseImpl>(
         factory, context.getParams().getContext());
 
-    return inner->connect(host, headers, *pipe.ends[0], *response).attach(
+    return inner->connect(host, headers, *pipe.ends[0], *response, settings).attach(
         kj::mv(host), kj::mv(headers), kj::mv(response), kj::mv(pipe))
         .exclusiveJoin(kj::mv(pumpTask));
   }
